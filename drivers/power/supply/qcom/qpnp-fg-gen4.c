@@ -6690,7 +6690,8 @@ static int fg_gen4_iio_read_raw(struct iio_dev *indio_dev,
 		 * battery profile until capacity learning produces a valid value.
 		 */
 		if (!rc && temp > 0 &&
-				temp <= (int64_t)fg->bp.nom_cap_uah * 2000) {
+				(fg->bp.nom_cap_uah <= 0 ||
+				 temp <= (int64_t)fg->bp.nom_cap_uah * 2000)) {
 			*val1 = (int)temp;
 		} else if (fg->bp.nom_cap_uah > 0) {
 			*val1 = fg->bp.nom_cap_uah * 1000;
