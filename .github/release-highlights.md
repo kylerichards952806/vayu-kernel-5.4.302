@@ -48,5 +48,27 @@ shows up as a flicker. Both vayu panels now advertise 120, 90 and 60 Hz only: th
 screen still runs at 120 while you touch it, still drops to 60 for video and idle,
 and no longer takes the 30 Hz detour. 24 fps video is unaffected, it uses 120/5.
 
+### Performance changes in this build
+
+Listed on their own, because they are easy to miss in the commit list and they are
+the ones that change how the phone feels:
+
+- **BBR + fq_codel by default.** Nothing in the ROM sets `tcp_congestion_control`
+  or `default_qdisc`, so the kernel default is what the phone actually runs. BBR
+  copes better with lossy mobile and Wi-Fi links than cubic, and fq_codel keeps
+  queueing delay down while something is saturating the link. Both are compiled in
+  and selected in `vayu.config`.
+- **Init-time zeroing turned off.** The defconfig zeroes every heap allocation and
+  every stack frame at function entry. That is real work on every syscall path.
+  Off here; CFI, the shadow call stack and the rest of the hardening stay.
+- **Panel refresh floor at 60 Hz.** Both panels no longer advertise 30/48/50 Hz, so
+  the display stops re-timing itself down to 30 Hz and straight back to 120 Hz on
+  an idle screen. Fewer DSI reconfigurations and less DPU work per minute, and it
+  removes the flicker that came with each switch.
+
+The scheduler, zram and GPU tweaks from other vayu trees were tried and left out:
+none of them produced a measurable gain here, and several touch paths this vendor
+kernel does not behave like theirs on.
+
 All of this is built on Ducky's 5.4 SM8150 port. The base is his work; the fixes
 above are mine on top of it.

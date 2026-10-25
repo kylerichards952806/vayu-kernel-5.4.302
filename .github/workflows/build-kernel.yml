@@ -670,13 +670,17 @@ jobs:
           # are how the build and the release page got made, not something a
           # reader flashing a kernel needs to scroll past, so the prefixes are
           # filtered out of every path below.
-          NOISE='(ci|cl|docs|github|chore)[:(]'
+          # Commits that are not kernel changes: repo plumbing, and the
+          # "tree:" bookkeeping commits that add and then take away the same
+          # patches, which net to nothing and only confuse the notes.
+          NOISE='(ci|cl|docs|github|chore|tree)[:(]'
           base=$(sed -n '1p' .github/changelog-base 2>/dev/null || true)
           if [ -n "$base" ]; then
             if git cat-file -e "${base}^{commit}" 2>/dev/null; then
               echo "changes since fork point $base"
               git log --first-parent --no-merges --format='- %s (%h)' \
-                "${base}..HEAD" | grep -vE "^- ($NOISE)" > changes.md || true
+                "${base}..HEAD" | grep -vE "^- ($NOISE)" \
+                | grep -vE '^- Revert "tree:' > changes.md || true
             else
               echo "::warning::changelog base $base is not in this clone (fetch-depth too shallow); falling back"
             fi
