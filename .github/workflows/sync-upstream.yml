@@ -1,0 +1,83 @@
+name: Sync Ducky's upstream
+
+# Pulls new commits from DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150 into this
+# branch on a schedule, because this tree is meant to track his work with only
+# a few patches on top. A plain merge is used on purpose: if one of our patches
+# touched the same lines, the job stops with the conflict instead of guessing,
+# and the branch is left exactly as it was. A successful push then triggers the
+# build workflow like any other commit.
+
+on:
+  schedule:
+    # Daily, 03:17 UTC. Off the hour so it does not queue with everyone else's.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report what is new, do not merge or push'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPO: DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150
+      UPSTREAM_BRANCH: MI_SM8150_5.4
+      BRANCH: MI_SM8150_5.4
+
+    steps:
+      - name: Check out the branch with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git config user.name  "kyler084"
+          git config user.email "kyler084@murena.io"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          echo "upstream tip: $(git rev-parse --short upstream/${UPSTREAM_BRANCH})"
+
+      - name: Report what is new
+        run: |
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "already contains upstream; nothing to do"
+            echo "NEW=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          n=$(git rev-list --count HEAD.."upstream/${UPSTREAM_BRANCH}")
+          echo "upstream is $n commit(s) ahead"
+          echo "NEW=$n" >> "$GITHUB_ENV"
+          {
+            echo "### Upstream commits in this sync"
+            echo
+            git log --no-merges --format='- %s (%h)' HEAD.."upstream/${UPSTREAM_BRANCH}" | head -60
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge upstream
+        if: env.NEW != '0' && inputs.dry_run != true
+        run: |
+          set -e
+          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "::error::merge conflicts with Ducky's tree; resolve them by hand and push"
+            git merge --abort || true
+            exit 1
+          fi
+          git log -1 --format='%h %s'
+
+      - name: Push (triggers the build workflow)
+        if: env.NEW != '0' && inputs.dry_run != true
+        run: |
+          git push origin "HEAD:${BRANCH}"
