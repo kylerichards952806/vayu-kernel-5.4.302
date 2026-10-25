@@ -378,19 +378,26 @@ jobs:
           #
           # The run number is the cheap source for N, but it restarts at 1 when a
           # repo is moved or re-created, which is exactly how a build came out as
-          # 0.0.1 after the private repo was made. So the newest published version
-          # is a floor: N never goes backwards, and after a move it carries on
-          # from the last release instead of starting over.
+          # 0.0.1 after the private repo was made. So the newest version in the
+          # tag list is a floor: N never goes backwards, and after a move it
+          # carries on from the last build instead of starting over.
           if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
             ver=$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE ))
             [ "$ver" -lt 1 ] && ver=1
-            last=$(gh release list --limit 200 --json tagName \
-              --jq '.[].tagName' 2>/dev/null \
+            # Tags rather than releases: a release can be deleted while its tag
+            # and images stay, and this build already found one that had gone
+            # missing and read the floor from a much older version. Both sources
+            # are checked and the higher wins.
+            last=$( { gh release list --limit 200 --json tagName \
+                        --jq '.[].tagName' 2>/dev/null
+                      git ls-remote --tags origin 2>/dev/null \
+                        | sed 's|.*refs/tags/||'
+                    } \
               | sed -n 's/^kernel-.*-0\.0\.\([0-9][0-9]*\)-[0-9-]*$/\1/p' \
               | sort -n | tail -1)
             if [ -n "${last:-}" ] && [ "$last" -ge "$ver" ]; then
               ver=$(( last + 1 ))
-              echo "::notice::run number wanted 0.0.$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE )); newest release is 0.0.${last}, so this build is 0.0.${ver}"
+              echo "::notice::run number wanted 0.0.$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE )); newest tag is 0.0.${last}, so this build is 0.0.${ver}"
             fi
             LOCALVERSION="-0.0.${ver}"
           else
