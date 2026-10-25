@@ -62,20 +62,18 @@
 
 		qcom,esd-err-irq-gpio = <&tlmm 5 0x2002>;
 		/*
-		 * Only 60 Hz and above are offered. Android drops the panel to the
-		 * lowest advertised rate whenever a frame is late, so with 50/48/30
-		 * in this list the panel was re-timed to 30 Hz and back to 120 Hz
-		 * every few seconds on an otherwise idle screen; each of those
-		 * switches is a real DSI reconfiguration and shows as a flicker.
-		 * Flooring the list at 60 Hz removes the deep dips and leaves the
-		 * useful part of the range (120 for scrolling, 90/60 for video and
-		 * idle) intact. 24 fps video still lands on 48 only through 120/5,
-		 * so nothing below 60 is needed here.
+		 * One mode only: 120 Hz, which is what timing@0 describes.
+		 *
+		 * Dynamic fps used to advertise <120 90 60 50 48 30>. Android takes the
+		 * lowest advertised rate whenever a frame is late and jumps back as soon
+		 * as the next one arrives, so an idle screen was re-timing the panel from
+		 * 120 Hz down to 30 Hz and straight back every few seconds. Every one of
+		 * those is a real DSI reconfiguration - dmesg shows
+		 * dsi_display_set_mode pairs all day - and on this panel it is visible as
+		 * a flicker. Flooring the list at 60 Hz removed the worst of it but the
+		 * 60 <-> 120 flapping stayed, so stop advertising extra rates: with a
+		 * single mode the display pipeline is configured once and left alone.
 		 */
-		qcom,mdss-dsi-pan-enable-dynamic-fps;
-		qcom,mdss-dsi-pan-fps-update =
-			"dfps_immediate_porch_mode_vfp";
-		qcom,dsi-supported-dfps-list = <120 90 60>;
 
 		qcom,dispparam-enabled;
 

@@ -61,17 +61,19 @@
 		qcom,mdss-dsi-panel-blackness-level = <3230>;
 
 		qcom,esd-err-irq-gpio = <&tlmm 5 0x2002>;
-		/* qcom,mdss-dsi-qsync-min-refresh-rate = <60>; */
 		/*
-		 * Floor the dynamic range at 60 Hz for the same reason as the other
-		 * vayu panel: Android drops to the lowest advertised rate when a
-		 * frame is late, and re-timing this panel to 30 Hz and straight back
-		 * to 120 Hz every few seconds is visible as a flicker.
+		 * One mode only: 120 Hz, which is what timing@0 describes.
+		 *
+		 * Dynamic fps used to advertise <120 90 60 50 48 30>. Android takes the
+		 * lowest advertised rate whenever a frame is late and jumps back as soon
+		 * as the next one arrives, so an idle screen was re-timing the panel from
+		 * 120 Hz down to 30 Hz and straight back every few seconds. Every one of
+		 * those is a real DSI reconfiguration - dmesg shows
+		 * dsi_display_set_mode pairs all day - and on this panel it is visible as
+		 * a flicker. Flooring the list at 60 Hz removed the worst of it but the
+		 * 60 <-> 120 flapping stayed, so stop advertising extra rates: with a
+		 * single mode the display pipeline is configured once and left alone.
 		 */
-		qcom,mdss-dsi-pan-enable-dynamic-fps;
-		qcom,mdss-dsi-pan-fps-update =
-			"dfps_immediate_porch_mode_vfp";
-		qcom,dsi-supported-dfps-list = <120 90 60>;
 
 		qcom,dispparam-enabled;
 
