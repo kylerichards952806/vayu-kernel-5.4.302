@@ -7,46 +7,32 @@ something different to say.
 
 ### What's in this build
 
-Two battery problems that have been there since this tree was ported to 5.4, both
-fixed in the kernel rather than worked around in userspace.
+A short one, because the tree got shorter. It now tracks Ducky's 5.4 SM8150
+branch with three things on top: the battery statistics fix, KernelSU-Next
+3.4.2-legacy and SUSFS 2.3.0. Everything else I had been stacking — the DS28E16
+battery authentication work, the charger thermal tables, the panel refresh-rate
+floor, BBR and fq_codel defaults, the small scheduler and NPU tweaks — went back
+to Ducky's version. A kernel that quietly differs from his in twenty places is
+harder to trust than one that matches it.
 
-The first was the battery stats screen. It showed "Unavailable" for design and
-maximum capacity, and the cycle count went back to a fresh number after every
-reboot. The fuel gauge was writing a partial SDAM cookie, so the learned capacity
-never survived a restart. It now writes the whole cookie, and falls back to the
-learned capacity when the battery profile has no nominal value instead of
-reporting zero. Design capacity, maximum capacity and cycle count show real
-numbers now, and they stay put across reboots.
+What stayed is the battery statistics fix, because it works. The fuel gauge was
+writing a partial SDAM cookie, so the learned capacity and the cycle count were
+thrown away on every restart and Settings showed "Unavailable" for design and
+maximum capacity. It writes the whole cookie now and keeps the learned capacity
+when the battery profile has no nominal value. Design capacity, maximum capacity
+and cycle count are real numbers, and they survive a reboot.
 
-The second was fast charging. The pack has a Maxim DS28E16 authentication chip and
-the driver had been sitting in the tree unused, so nothing ever asked the battery
-who it was. SMB5 now reads the result five seconds after probe, retries while the
-supplier is still coming up, and re-checks every minute so a replaced battery gets
-judged on its own merit.
+Under that: KernelSU-Next 3.4.2-legacy hooked through kprobes, and SUSFS 2.3.0
+providing path, mount, kstat and cmdline hiding through the supercall. If you run
+the SUSFS module, `ksu_susfs` is the interface it expects.
 
-My pack is an aftermarket one, and a genuine handshake with it is not something I
-can rely on, so this build sets `CONFIG_BATT_VERIFY_FORCE_VERIFIED`: the driver
-still registers `batt_verify` and answers the charger, but reports
-`authen_result 1` / `chip_ok 1` without touching the 1-Wire bus. The unverified
-charge cap is dropped, which is the whole point. If you run a genuine pack and
-want the real check back, turn that option off and the handshake returns.
+No DS28E16 and no 33 W work in this build. Ducky's tree leaves that option off
+and so does this one, so a genuine pack and an aftermarket one both behave the way
+they do on his kernel.
 
-What I cannot tell you is whether it actually charges at 33 W, because I don't own
-a genuine Xiaomi 33 W charger. That is as far as the driver side goes on my own.
+If something misbehaves, say which tag you are on (`uname -r`) and attach a
+`dmesg` from the boot that went wrong. That is worth more than a description.
 
-So if you have the original 33 W brick, please fill in the
-[33 W charging test](https://github.com/kylerichards952806/android_kernel_xiaomi_sm8150/issues/new?template=33w-charging-test.yml)
-form: charger model, measured wattage, the dmesg authentication lines, the sysfs
-charging values and the battery info screen. "Still caps at 18 W" is just as
-useful to hear as "it does 33 W".
-
-There is one display fix in this build too. With the panel advertising 50, 48 and
-30 Hz, Android dropped it to 30 Hz the moment a frame came in late and pulled it
-straight back to 120 Hz when the next one arrived, which on an idle screen meant a
-DSI re-timing every few seconds. Each switch is a full display reconfiguration and
-shows up as a flicker. Both vayu panels now advertise 120, 90 and 60 Hz only: the
-screen still runs at 120 while you touch it, still drops to 60 for video and idle,
-and no longer takes the 30 Hz detour. 24 fps video is unaffected, it uses 120/5.
-
-All of this is built on Ducky's 5.4 SM8150 port. The base is his work; the fixes
-above are mine on top of it.
+All credit for the base goes to [Ducky](https://github.com/DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150).
+This fork is only adaptations on top of his project, and the fixes that remain here
+are mine. Thank you, Ducky.
