@@ -124,9 +124,10 @@ env:
     androidboot.fstab_suffix=qcom androidboot.init_fatal_reboot_target=recovery
   BOOT_OS_VERSION: '0x220001aa'
   # Version shown in Android settings: 5.4.302-vayu-kyler084-0.0.<n>, where n
-  # climbs by one on every compile. n is derived from the workflow run number,
-  # so it needs no stored counter; BUILD_VERSION_BASE is the run number that is
-  # "0.0.1", which makes the next build's number predictable.
+  # climbs by one on every compile. n is whatever the workflow run number says,
+  # with BUILD_VERSION_BASE as the run that was "0.0.1"; no stored counter. The
+  # newest published release is checked as well and wins if it is higher, so the
+  # number never goes backwards when run numbers restart (repo move, re-create).
   BUILD_VERSION_BASE: '27'
 
 jobs:
@@ -282,6 +283,8 @@ jobs:
           key: android-${{ env.CLANG_PREBUILT_DIR }}-${{ env.CLANG_PREBUILT_SHA }}-v1
 
       - name: Install toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           if [ "${{ inputs.toolchain || 'android-clang-22' }}" = "llvm-18" ]; then
@@ -368,13 +371,27 @@ jobs:
           echo "PATH=$BIN:$PATH" >> "$GITHUB_ENV"
           echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
 
-          # Build number: 0.0.1 on the first run after BUILD_VERSION_BASE, +1 per
-          # compile. Passing LOCALVERSION on the make command line also makes
+          # Build number: 0.0.N, climbing by one on every compile. Passing
+          # LOCALVERSION on the make command line also makes
           # scripts/setlocalversion drop the -g<sha> suffix, which is the long
           # string that used to end the version shown in settings.
+          #
+          # The run number is the cheap source for N, but it restarts at 1 when a
+          # repo is moved or re-created, which is exactly how a build came out as
+          # 0.0.1 after the private repo was made. So the newest published version
+          # is a floor: N never goes backwards, and after a move it carries on
+          # from the last release instead of starting over.
           if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
             ver=$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE ))
             [ "$ver" -lt 1 ] && ver=1
+            last=$(gh release list --limit 200 --json tagName \
+              --jq '.[].tagName' 2>/dev/null \
+              | sed -n 's/^kernel-.*-0\.0\.\([0-9][0-9]*\)-[0-9-]*$/\1/p' \
+              | sort -n | tail -1)
+            if [ -n "${last:-}" ] && [ "$last" -ge "$ver" ]; then
+              ver=$(( last + 1 ))
+              echo "::notice::run number wanted 0.0.$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE )); newest release is 0.0.${last}, so this build is 0.0.${ver}"
+            fi
             LOCALVERSION="-0.0.${ver}"
           else
             LOCALVERSION=""
@@ -733,7 +750,10 @@ jobs:
             # missing or empty, the commit list below is all the notes get.
             if [ -s .github/release-highlights.md ]; then
               echo
-              cat .github/release-highlights.md
+              # The file opens with an HTML comment explaining how to edit it.
+              # It is a note to whoever changes the file, not to anyone reading
+              # the release, so drop the comment block from the notes.
+              sed '/^<!--$/,/^-->$/d' .github/release-highlights.md
               echo
             fi
             echo '### Commits in this build'

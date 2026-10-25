@@ -35,7 +35,7 @@ What I cannot tell you is whether it actually charges at 33 W, because I don't o
 a genuine Xiaomi 33 W charger. That is as far as the driver side goes on my own.
 
 So if you have the original 33 W brick, please fill in the
-[33 W charging test](https://github.com/kylerichards952806/android_kernel_xiaomi_sm8150/issues/new?template=33w-charging-test.yml)
+[33 W charging test](https://github.com/kylerichards952806/vayu-kernel-5.4.302/issues/new?template=33w-charging-test.yml)
 form: charger model, measured wattage, the dmesg authentication lines, the sysfs
 charging values and the battery info screen. "Still caps at 18 W" is just as
 useful to hear as "it does 33 W".
@@ -44,9 +44,11 @@ There is one display fix in this build too. With the panel advertising 50, 48 an
 30 Hz, Android dropped it to 30 Hz the moment a frame came in late and pulled it
 straight back to 120 Hz when the next one arrived, which on an idle screen meant a
 DSI re-timing every few seconds. Each switch is a full display reconfiguration and
-shows up as a flicker. Both vayu panels now advertise 120, 90 and 60 Hz only: the
-screen still runs at 120 while you touch it, still drops to 60 for video and idle,
-and no longer takes the 30 Hz detour. 24 fps video is unaffected, it uses 120/5.
+shows up as a flicker. Both vayu panels now advertise 120 and 60 Hz only, and the
+floor is pinned at 120 Hz, so the screen holds 120 instead of bouncing around.
+60 Hz is still there for anything that explicitly asks for it — 24 fps video, for
+instance, is watchable at 120/2 — it just is not somewhere the compositor drifts to
+on its own. 90 Hz is gone: no mode on this panel genuinely wants it.
 
 ### Performance changes in this build
 
@@ -61,10 +63,11 @@ the ones that change how the phone feels:
 - **Init-time zeroing turned off.** The defconfig zeroes every heap allocation and
   every stack frame at function entry. That is real work on every syscall path.
   Off here; CFI, the shadow call stack and the rest of the hardening stay.
-- **Panel refresh floor at 60 Hz.** Both panels no longer advertise 30/48/50 Hz, so
-  the display stops re-timing itself down to 30 Hz and straight back to 120 Hz on
-  an idle screen. Fewer DSI reconfigurations and less DPU work per minute, and it
-  removes the flicker that came with each switch.
+- **Panel refresh floor at 120 Hz.** Both panels advertise 120 and 60 Hz and nothing
+  else, and the minimum refresh is pinned at 120, so the display stops re-timing
+  itself down to 30/48/50 Hz and straight back up again on an idle screen. Fewer
+  DSI reconfigurations and less DPU work per minute, and it removes the flicker
+  that came with each switch.
 
 The scheduler, zram and GPU tweaks from other vayu trees were tried and left out:
 none of them produced a measurable gain here, and several touch paths this vendor
