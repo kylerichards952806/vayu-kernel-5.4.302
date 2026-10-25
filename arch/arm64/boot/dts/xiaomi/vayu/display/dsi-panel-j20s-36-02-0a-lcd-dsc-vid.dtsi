@@ -62,10 +62,16 @@
 
 		qcom,esd-err-irq-gpio = <&tlmm 5 0x2002>;
 		/* qcom,mdss-dsi-qsync-min-refresh-rate = <60>; */
+		/*
+		 * Floor the dynamic range at 60 Hz for the same reason as the other
+		 * vayu panel: Android drops to the lowest advertised rate when a
+		 * frame is late, and re-timing this panel to 30 Hz and straight back
+		 * to 120 Hz every few seconds is visible as a flicker.
+		 */
 		qcom,mdss-dsi-pan-enable-dynamic-fps;
 		qcom,mdss-dsi-pan-fps-update =
 			"dfps_immediate_porch_mode_vfp";
-		qcom,dsi-supported-dfps-list = <120 90 60 50 48 30>;
+		qcom,dsi-supported-dfps-list = <120 90 60>;
 
 		qcom,dispparam-enabled;
 

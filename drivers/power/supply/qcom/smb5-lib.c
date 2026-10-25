@@ -881,19 +881,14 @@ int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable)
 	if (IS_ERR_OR_NULL(chg->iio_chan_list_qg))
 		return 0;
 
-// #if defined(CONFIG_BATT_VERIFY_BY_DS28E16) || defined(CONFIG_BATT_VERIFY_BY_DS28E16_NABU)
-// 	rc = smblib_get_prop_from_bms(chg,
-// 					SMB5_QG_AUTHENTIC, &pval.intval);
-// 	if (rc < 0) {
-// 		smblib_err(chg, "Couldn't get battery authentic:%d\n", rc);
-// 		return rc;
-// 	}
-// 	if (!pval.intval)
-// 		enable = false;
-// // #else //debug: fatal if bat is 95%+
-// // 	smblib_err(chg, "battery authentic disabled, enable fastcharge anyway:%d\n", rc);
-// // 	enable = true;
-// #endif
+	/*
+	 * Battery authentication is deliberately not read here.  The DS28E16
+	 * properties that carry the ROM ID and page data are byte arrays and
+	 * an IIO channel can only return an int, so those stay a sysfs
+	 * interface on "batt_verify".  The verified result the charger acts on
+	 * comes from smblib_batt_verify_update_work(), which reads
+	 * authen_result through the power supply.
+	 */
 
 	/*if soc > 95 do not set fastcharge flag*/
 	rc = smblib_get_prop_from_bms(chg,
@@ -1388,7 +1383,8 @@ int smblib_get_prop_from_bms(struct smb_charger *chg,
 {
 	int rc;
 
-	if (IS_ERR_OR_NULL(chg->iio_chan_list_qg))
+	if (IS_ERR_OR_NULL(chg->iio_chan_list_qg) ||
+			IS_ERR_OR_NULL(chg->iio_chan_list_qg[channel]))
 		return -ENODEV;
 
 	rc = iio_read_channel_processed(chg->iio_chan_list_qg[channel],
@@ -11331,34 +11327,66 @@ relax:
 }
 
 #if defined(CONFIG_BATT_VERIFY_BY_DS28E16)
+/*
+ * The battery authentication result is exported by the Maxim DS28E16 driver
+ * as the "batt_verify" power supply.  SMB5_QG_AUTHENTIC is the last member of
+ * enum qg_chg_iio_channels but has no entry in smblib_qg_ext_iio_chan, so the
+ * array built from that table is one element shorter than the enum: reading
+ * the channel would index past the end of iio_chan_list_qg and never return a
+ * result.  Use the power supply, which is the only real provider.
+ */
+static int smblib_get_batt_verify_result(struct smb_charger *chg, int *val)
+{
+	int rc;
+	struct power_supply *psy;
+	union power_supply_propval pval = {0};
+
+	psy = power_supply_get_by_name("batt_verify");
+	if (!psy)
+		return -ENODEV;
+
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_AUTHEN_RESULT,
+				       &pval);
+	power_supply_put(psy);
+	if (rc < 0)
+		return rc;
+
+	*val = pval.intval;
+	return 0;
+}
+
 static void smblib_batt_verify_update_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
-			batt_verify_update_work.work);
+					       batt_verify_update_work.work);
 	int rc, pval = 0;
 	static int count;
 
-	rc = smblib_get_prop_from_bms(chg,
-					SMB5_QG_AUTHENTIC, &pval);
+	rc = smblib_get_batt_verify_result(chg, &pval);
 	if (rc < 0) {
-		pr_err("Couldn't get batt verify status rc=%d\n", rc);
+		smblib_dbg(chg, PR_MISC, "Couldn't get batt verify status rc=%d\n",
+			   rc);
+		pval = 0;
 	}
+
 	chg->batt_verified = pval;
-	pr_err("batt_verified =%d\n", chg->batt_verified);
+
 	if (chg->batt_verified) {
+		/* authenticated pack: drop the unverified-battery FCC cap */
 		vote(chg->fcc_votable, BATT_VERIFY_VOTER, false, 0);
 		count = 0;
-		return;
-	}
-	if (count < 3) {
-		count ++;
-		pr_err("battery verify failed, we will recheck it!\n");
+	} else if (count < 3) {
+		count++;
 		schedule_delayed_work(&chg->batt_verify_update_work,
-			msecs_to_jiffies(3000));
+				      msecs_to_jiffies(3000));
+		return;
 	} else {
 		count = 0;
 	}
 
+	/* re-check so a replaced battery is verified/limited again */
+	schedule_delayed_work(&chg->batt_verify_update_work,
+			      msecs_to_jiffies(60000));
 }
 #endif
 
@@ -11574,6 +11602,8 @@ int smblib_init(struct smb_charger *chg)
 #ifdef CONFIG_MACH_XIAOMI_SM8150
 #if defined(CONFIG_BATT_VERIFY_BY_DS28E16)
 	INIT_DELAYED_WORK(&chg->batt_verify_update_work, smblib_batt_verify_update_work);
+	schedule_delayed_work(&chg->batt_verify_update_work,
+			      msecs_to_jiffies(5000));
 #endif
 	INIT_DELAYED_WORK(&chg->raise_qc3_vbus_work, smblib_raise_qc3_vbus_work);
 	INIT_DELAYED_WORK(&chg->charger_type_recheck, smblib_charger_type_recheck);
