@@ -18,8 +18,12 @@ on:
         type: boolean
         default: false
 
+# actions: write so the build can be started explicitly. A push made with the
+# workflow's own GITHUB_TOKEN does not trigger other workflows, so the build
+# would never run from this job otherwise.
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -77,7 +81,18 @@ jobs:
           fi
           git log -1 --format='%h %s'
 
-      - name: Push (triggers the build workflow)
+      - name: Push
         if: env.NEW != '0' && inputs.dry_run != true
         run: |
           git push origin "HEAD:${BRANCH}"
+
+      # GitHub does not start a workflow for a push made with GITHUB_TOKEN, so
+      # ask for the build directly. It is the same build a push would start.
+      - name: Start the build
+        if: env.NEW != '0' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build-kernel.yml --ref "${BRANCH}"
+          sleep 5
+          gh run list --workflow build-kernel.yml --limit 1
