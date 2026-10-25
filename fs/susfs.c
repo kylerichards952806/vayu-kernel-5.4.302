@@ -18,6 +18,7 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/workqueue.h>
+#include <linux/preempt.h>
 #include <linux/fsnotify_backend.h>
 #include <linux/jump_label.h>
 #include <linux/version.h> // We need check kernel version.
@@ -46,29 +47,43 @@ DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled);
 DEFINE_STATIC_SRCU(susfs_srcu_sus_path_loop);
 static DEFINE_MUTEX(susfs_mutex_lock_sus_path);
 static LIST_HEAD(LH_SUS_PATH_LOOP);
-const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-test the dcache lookup, make sure you don't have file named like this!!
+/*
+ * Everything below does a path lookup, and a lookup can sleep: f2fs lands in
+ * fscrypt_fname_encrypt() -> wait_for_completion() on an encrypted directory,
+ * and the dentry may simply not be cached yet.
+ *
+ * The command path is ksu_handle_sys_reboot(), which KernelSU hooks with a
+ * kprobe on __arm64_sys_reboot. Kprobe handlers run with preemption disabled,
+ * so a lookup there is "BUG: scheduling while atomic", an RCU stall on the
+ * CPU that was running it, and a dead device that resets with nothing in the
+ * log to explain it - exactly the reboot-with-no-reason this tree kept
+ * showing at boot, when the SUSFS module adds its sus paths.
+ *
+ * So: in atomic context the request is copied with __copy_from_user(), which
+ * cannot fault or sleep, and applied by a workqueue item in process context.
+ * The supercall still reports success; the flag lands a moment later.
+ */
+struct susfs_sus_path_work {
+	struct work_struct work;
+	struct st_susfs_sus_path info;
+};
 
-void susfs_add_sus_path(void __user **user_info) {
-	struct st_susfs_sus_path info = {0};
+static void susfs_sus_path_apply(struct st_susfs_sus_path *info)
+{
 	struct path path;
 	struct inode *inode = NULL;
 	struct fuse_inode *fi = NULL;
 
-	if (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
-
-	info.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
-	if (info.err) {
-		SUSFS_LOGE("failed opening file '%s'\n", info.target_pathname);
-		goto out_copy_to_user;
+	info->err = kern_path(info->target_pathname, LOOKUP_FOLLOW, &path);
+	if (info->err) {
+		SUSFS_LOGE("failed opening file '%s'\n", info->target_pathname);
+		return;
 	}
 
 	inode = d_backing_inode(path.dentry);
 	if (!inode || !inode->i_mapping) {
 		SUSFS_LOGE("inode || inode->i_mapping is NULL\n");
-		info.err = -ENOENT;
+		info->err = -ENOENT;
 		goto out_path_put_path;
 	}
 
@@ -76,23 +91,68 @@ void susfs_add_sus_path(void __user **user_info) {
 		fi = get_fuse_inode(inode);
 		if (!fi || !fi->inode.i_mapping) {
 			SUSFS_LOGE("fi || fi->inode.i_mapping is NULL\n");
-			info.err = -ENOENT;
+			info->err = -ENOENT;
 			goto out_path_put_path;
 		}
 		set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_state);
 		set_bit(AS_FLAGS_SUS_PATH, &inode->i_state);
 		SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', fi->nodeid: %llu, fi->inode.i_ino: %lu, fi->inode.i_state: 0x%lx\n",
-					info.target_pathname, fi->nodeid, fi->inode.i_ino, fi->inode.i_state);
-		info.err = 0;
+					info->target_pathname, fi->nodeid, fi->inode.i_ino, fi->inode.i_state);
+		info->err = 0;
 		goto out_path_put_path;
 	}
 
 	set_bit(AS_FLAGS_SUS_PATH, &inode->i_state);
 	SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', ino: '%lu', inode->i_state: 0x%lx\n",
-				info.target_pathname, inode->i_ino, inode->i_state);
-	info.err = 0;
+				info->target_pathname, inode->i_ino, inode->i_state);
+	info->err = 0;
 out_path_put_path:
 	path_put(&path);
+}
+
+static void susfs_sus_path_work_fn(struct work_struct *work)
+{
+	struct susfs_sus_path_work *w =
+		container_of(work, struct susfs_sus_path_work, work);
+
+	susfs_sus_path_apply(&w->info);
+	kfree(w);
+}
+
+const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-test the dcache lookup, make sure you don't have file named like this!!
+
+void susfs_add_sus_path(void __user **user_info) {
+	struct st_susfs_sus_path info = {0};
+	struct susfs_sus_path_work *w = NULL;
+
+	/* See susfs_sus_path_apply(): no path lookups with preemption off. */
+	if (unlikely(in_interrupt() || irqs_disabled() || preempt_count() != 0)) {
+		w = kmalloc(sizeof(*w), GFP_ATOMIC);
+		if (!w) {
+			info.err = -ENOMEM;
+			goto out_copy_to_user;
+		}
+		if (__copy_from_user(&w->info, (void __user *)*user_info, sizeof(w->info))) {
+			kfree(w);
+			info.err = -EFAULT;
+			goto out_copy_to_user;
+		}
+		/* Log before queuing: the work item owns w from here on. */
+		SUSFS_LOGI("CMD_SUSFS_ADD_SUS_PATH deferred to workqueue: '%s'\n",
+				w->info.target_pathname);
+		w->info.err = 0;
+		INIT_WORK(&w->work, susfs_sus_path_work_fn);
+		schedule_work(&w->work);
+		info.err = 0;
+		goto out_copy_to_user;
+	}
+
+	if (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out_copy_to_user;
+	}
+
+	susfs_sus_path_apply(&info);
 out_copy_to_user:
 	if (copy_to_user(&((struct st_susfs_sus_path __user*)*user_info)->err, &info.err, sizeof(info.err))) {
 		info.err = -EFAULT;
