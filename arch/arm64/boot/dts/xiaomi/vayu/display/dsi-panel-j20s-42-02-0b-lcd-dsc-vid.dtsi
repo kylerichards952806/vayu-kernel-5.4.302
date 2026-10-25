@@ -61,11 +61,21 @@
 		qcom,mdss-dsi-panel-blackness-level = <3230>;
 
 		qcom,esd-err-irq-gpio = <&tlmm 5 0x2002>;
-		/* qcom,mdss-dsi-qsync-min-refresh-rate = <60>; */
+		/*
+		 * Only 60 Hz and above are offered. Android drops the panel to the
+		 * lowest advertised rate whenever a frame is late, so with 50/48/30
+		 * in this list the panel was re-timed to 30 Hz and back to 120 Hz
+		 * every few seconds on an otherwise idle screen; each of those
+		 * switches is a real DSI reconfiguration and shows as a flicker.
+		 * Flooring the list at 60 Hz removes the deep dips and leaves the
+		 * useful part of the range (120 for scrolling, 90/60 for video and
+		 * idle) intact. 24 fps video still lands on 48 only through 120/5,
+		 * so nothing below 60 is needed here.
+		 */
 		qcom,mdss-dsi-pan-enable-dynamic-fps;
 		qcom,mdss-dsi-pan-fps-update =
 			"dfps_immediate_porch_mode_vfp";
-		qcom,dsi-supported-dfps-list = <120 90 60 50 48 30>;
+		qcom,dsi-supported-dfps-list = <120 90 60>;
 
 		qcom,dispparam-enabled;
 

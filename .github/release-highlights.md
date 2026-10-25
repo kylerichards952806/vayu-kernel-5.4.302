@@ -40,5 +40,13 @@ form: charger model, measured wattage, the dmesg authentication lines, the sysfs
 charging values and the battery info screen. "Still caps at 18 W" is just as
 useful to hear as "it does 33 W".
 
+There is one display fix in this build too. With the panel advertising 50, 48 and
+30 Hz, Android dropped it to 30 Hz the moment a frame came in late and pulled it
+straight back to 120 Hz when the next one arrived, which on an idle screen meant a
+DSI re-timing every few seconds. Each switch is a full display reconfiguration and
+shows up as a flicker. Both vayu panels now advertise 120, 90 and 60 Hz only: the
+screen still runs at 120 while you touch it, still drops to 60 for video and idle,
+and no longer takes the 30 Hz detour. 24 fps video is unaffected, it uses 120/5.
+
 All of this is built on Ducky's 5.4 SM8150 port. The base is his work; the fixes
 above are mine on top of it.
