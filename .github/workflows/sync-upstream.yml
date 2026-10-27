@@ -2,10 +2,15 @@ name: Sync Ducky's upstream
 
 # Pulls new commits from DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150 into this
 # branch on a schedule, because this tree is meant to track his work with only
-# a few patches on top. A plain merge is used on purpose: if one of our patches
-# touched the same lines, the job stops with the conflict instead of guessing,
-# and the branch is left exactly as it was. A successful push then triggers the
-# build workflow like any other commit.
+# a few patches on top.
+#
+# When one of this fork's patches has been overtaken by his work, his version
+# wins: the conflicted paths are taken from his tree, the reversal is recorded
+# as a trailer on the merge commit, and the release notes report it. Stopping
+# for a hand resolution instead is what let the branch sit four commits behind
+# while a conflicting battery patch blocked every sync.
+#
+# A successful push then triggers the build workflow like any other commit.
 
 on:
   schedule:
@@ -70,16 +75,74 @@ jobs:
             git log --no-merges --format='- %s (%h)' HEAD.."upstream/${UPSTREAM_BRANCH}" | head -60
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Merge upstream
+      - name: Merge upstream, resolving conflicts in Ducky's favour
         if: env.NEW != '0' && inputs.dry_run != true
         run: |
-          set -e
-          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
-            echo "::error::merge conflicts with Ducky's tree; resolve them by hand and push"
-            git merge --abort || true
-            exit 1
+          set -eu
+          # His tree is what this branch tracks, so a conflict means a patch of
+          # ours has been overtaken: he changed the same lines for a reason.
+          # Keeping ours would quietly undo his fix, and stopping for a hand
+          # resolution is what previously left the branch four commits behind
+          # (a battery patch conflicted with his power-supply work and every
+          # sync failed on it). So the conflicted paths are taken from his tree,
+          # the reversal is written into the merge commit, and the build runs.
+          rm -f superseded.txt
+          if git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}"; then
+            echo 'merged cleanly'
+          else
+            paths=$(git diff --name-only --diff-filter=U)
+            if [ -z "$paths" ]; then
+              echo '::error::merge failed with no conflicted paths to resolve'
+              git merge --abort || true
+              exit 1
+            fi
+            echo 'conflicts (his version wins):'
+            printf '%s\n' "$paths" | while IFS= read -r p; do
+              [ -n "$p" ] || continue
+              if git cat-file -e "upstream/${UPSTREAM_BRANCH}:$p" 2>/dev/null; then
+                git checkout "upstream/${UPSTREAM_BRANCH}" -- "$p"
+                git add -- "$p"
+              else
+                # He deleted the file, so the deletion is his answer.
+                git rm -q -f -- "$p" || true
+              fi
+              # Which of our commits last had a say in this path, so the notes
+              # can name the change that was reversed rather than just a file.
+              ours=$(git log -1 --format='%h %s' HEAD -- "$p" | cut -c1-72)
+              printf 'Superseded-by-upstream: %s (%s)\n' "$p" "$ours" >> superseded.txt
+              echo "  $p"
+            done
           fi
+
+          # One message for both cases, so the release notes can read the
+          # trailers off the merge commit no matter how it went.
+          {
+            echo "Merge Ducky's upstream MI_SM8150_5.4"
+            if [ -s superseded.txt ]; then
+              echo
+              echo "Conflicts were resolved in Ducky's favour: for every file below"
+              echo "this branch carries his version, and the change this fork had"
+              echo "made to it is reversed until it is re-applied on top of his work."
+              echo
+              cat superseded.txt
+            fi
+          } > merge-msg.txt
+          git commit -F merge-msg.txt
+          rm -f merge-msg.txt
           git log -1 --format='%h %s'
+
+          if [ -s superseded.txt ]; then
+            {
+              echo '### Conflict resolution: Ducky'"'"'s version kept'
+              echo
+              sed 's/^Superseded-by-upstream: /- /' superseded.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # The build refuses to run on a branch that does not contain his tip,
+          # so prove the merge really put it there before pushing anything.
+          git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD \
+            || { echo '::error::merge did not bring in the upstream tip'; exit 1; }
 
       - name: Push
         if: env.NEW != '0' && inputs.dry_run != true
