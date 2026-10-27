@@ -7,16 +7,72 @@ something different to say.
 
 ### What's in this build
 
-Ducky's `MI_SM8150_5.4` at the commit this build was made from, plus the root
-layer and nothing else:
+Two battery problems that have been there since this tree was ported to 5.4, both
+fixed in the kernel rather than worked around in userspace.
 
-- **KernelSU-Next v3.4.0-legacy**, builtin, hooked through kprobes because this
-  tree is non-GKI and has no vendor `security/` hooks to sit in.
-- **SUSFS 2.3.0** on top of it, with the KernelSU-Next glue that lets the
-  manager drive it.
+The first was the battery stats screen. It showed "Unavailable" for design and
+maximum capacity, and the cycle count went back to a fresh number after every
+reboot. The fuel gauge was writing a partial SDAM cookie, so the learned capacity
+never survived a restart. It now writes the whole cookie, and falls back to the
+learned capacity when the battery profile has no nominal value instead of
+reporting zero. Design capacity, maximum capacity and cycle count show real
+numbers now, and they stay put across reboots.
 
-Everything I had added on top of Ducky's kernel is gone from this build: the
-fuel gauge work, the DS28E16 battery authentication, the thermal and panel
-changes, the network defaults and the DTS edits. This is his kernel with root
-and su hiding, so a problem that is not about KernelSU or SUSFS is his tree's
-to answer — and one that is, is probably mine.
+The second was fast charging. The pack has a Maxim DS28E16 authentication chip and
+the driver had been sitting in the tree unused, so nothing ever asked the battery
+who it was. SMB5 now reads the result five seconds after probe, retries while the
+supplier is still coming up, and re-checks every minute so a replaced battery gets
+judged on its own merit.
+
+My pack is an aftermarket one, and a genuine handshake with it is not something I
+can rely on, so this build sets `CONFIG_BATT_VERIFY_FORCE_VERIFIED`: the driver
+still registers `batt_verify` and answers the charger, but reports
+`authen_result 1` / `chip_ok 1` without touching the 1-Wire bus. The unverified
+charge cap is dropped, which is the whole point. If you run a genuine pack and
+want the real check back, turn that option off and the handshake returns.
+
+What I cannot tell you is whether it actually charges at 33 W, because I don't own
+a genuine Xiaomi 33 W charger. That is as far as the driver side goes on my own.
+
+So if you have the original 33 W brick, please fill in the
+[33 W charging test](https://github.com/kylerichards952806/vayu-kernel-5.4.302/issues/new?template=33w-charging-test.yml)
+form: charger model, measured wattage, the dmesg authentication lines, the sysfs
+charging values and the battery info screen. "Still caps at 18 W" is just as
+useful to hear as "it does 33 W".
+
+There is one display fix in this build too. With the panel advertising 50, 48 and
+30 Hz, Android dropped it to 30 Hz the moment a frame came in late and pulled it
+straight back to 120 Hz when the next one arrived, which on an idle screen meant a
+DSI re-timing every few seconds. Each switch is a full display reconfiguration and
+shows up as a flicker. Both vayu panels now advertise 120 and 60 Hz only, and the
+floor is pinned at 120 Hz, so the screen holds 120 instead of bouncing around.
+60 Hz is still there for anything that explicitly asks for it — 24 fps video, for
+instance, is watchable at 120/2 — it just is not somewhere the compositor drifts to
+on its own. 90 Hz is gone: no mode on this panel genuinely wants it.
+
+### Performance changes in this build
+
+Listed on their own, because they are easy to miss in the commit list and they are
+the ones that change how the phone feels:
+
+- **BBR + fq_codel by default.** Nothing in the ROM sets `tcp_congestion_control`
+  or `default_qdisc`, so the kernel default is what the phone actually runs. BBR
+  copes better with lossy mobile and Wi-Fi links than cubic, and fq_codel keeps
+  queueing delay down while something is saturating the link. Both are compiled in
+  and selected in `vayu.config`.
+- **Init-time zeroing turned off.** The defconfig zeroes every heap allocation and
+  every stack frame at function entry. That is real work on every syscall path.
+  Off here; CFI, the shadow call stack and the rest of the hardening stay.
+- **Panel refresh floor at 120 Hz.** Both panels advertise 120 and 60 Hz and nothing
+  else, and the minimum refresh is pinned at 120, so the display stops re-timing
+  itself down to 30/48/50 Hz and straight back up again on an idle screen. Fewer
+  DSI reconfigurations and less DPU work per minute, and it removes the flicker
+  that came with each switch.
+
+The scheduler, zram and GPU tweaks from other vayu trees were tried and left out:
+none of them produced a measurable gain here, and several touch paths this vendor
+kernel does not behave like theirs on.
+
+All of this is built on Ducky's 5.4 SM8150 port. The base is his work; the fixes
+above are mine on top of it.
+
