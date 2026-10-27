@@ -186,9 +186,14 @@ jobs:
               "repos/$UPSTREAM_REPO/compare/$UPSTREAM_BRANCH...$HEAD_REPO:$HEAD_BRANCH" \
               --jq '.behind_by' 2>/dev/null); then
             echo '::warning::could not compare against upstream (API error); sync check skipped'
+            echo 'BEHIND=unknown' >> "$GITHUB_ENV"
             exit 0
           fi
           echo "commits behind upstream $UPSTREAM_REPO@$UPSTREAM_BRANCH: $behind"
+          # The changelog step decides from this whether this build really
+          # contains his tip, and therefore whether it may list his commits as
+          # included in the build.
+          echo "BEHIND=$behind" >> "$GITHUB_ENV"
 
           if [ "$behind" = "0" ]; then
             echo "::notice::tree contains the current upstream tip"
@@ -723,20 +728,55 @@ jobs:
           fi
           [ -s changes.md ] || echo '- (no commits recorded)' > changes.md
 
-          # Ducky's commits, credited separately. A merge from his tree can carry
-          # his entire port (hundreds of commits) the first time and a handful of
-          # patches afterwards; listing the whole import would bury the release
-          # page, so take the newest merge that brings a normal change set and
-          # list that one. Newest first, so the most recent sync wins.
+          # Ducky's own commits, credited separately.
+          #
+          # They cannot be read off --first-parent. A sync merges his tree, so his
+          # commits hang off the merge's second parent and never appear on the
+          # first-parent line; that used to leave the release page crediting him
+          # for work it never listed. What he actually contributed is everything
+          # reachable from HEAD that is not one of ours: subtract the first-parent
+          # chain.
+          #
+          # The range starts at the previous release tag, not at the fork point,
+          # so the list is his work new in this build rather than every commit he
+          # has published since this branch began, which would grow without bound.
+          left=$(git describe --tags --abbrev=0 --match 'kernel-*' 2>/dev/null || true)
+          # Only a tag that is still on this branch is a usable left edge. After
+          # a rebuilt or force-pushed branch the newest tag can hang off a
+          # history this one does not descend from, and the range below would
+          # then sweep in every commit his tree has ever had.
+          if [ -n "$left" ] &&
+             { ! git cat-file -e "${left}^{commit}" 2>/dev/null ||
+               ! git merge-base --is-ancestor "$left" HEAD; }; then
+            echo "::warning::previous tag $left is not in this clone's history; using the fork point"
+            left=""
+          fi
+          [ -n "$left" ] || left="$base"
           rm -f ducky.md
-          for m in $(git rev-list --merges --first-parent "${base}..HEAD" | head -10); do
-            n=$(git rev-list --count --no-merges "$m^1..$m^2" 2>/dev/null || echo 0)
-            if [ "$n" -ge 1 ] && [ "$n" -le 50 ]; then
-              git log --no-merges --format='- %s (%h)' "$m^1..$m^2" \
+          if [ -n "$left" ] && [ "${BEHIND:-unknown}" = "0" ]; then
+            git rev-list --first-parent --no-merges "${left}..HEAD" > ours.txt
+            git rev-list --no-merges "${left}..HEAD" \
+              | grep -vxF -f ours.txt > his.txt || true
+            if [ -s his.txt ]; then
+              total=$(wc -l < his.txt | tr -d ' ')
+              echo "upstream commits new in this build: $total"
+              git log --no-walk=unsorted --format='- %s (%h)' $(head -60 his.txt) \
                 | grep -vE "^- ($NOISE)" > ducky.md || true
-              [ -s ducky.md ] && break
+              if [ "$total" -gt 60 ]; then
+                echo "- …and $((total - 60)) more in his tree" >> ducky.md
+              fi
             fi
-          done
+          fi
+
+          # Files a sync had to hand back to Ducky. The sync job resolves a
+          # conflict in his favour and records it as a trailer on the merge
+          # commit, so the notes can say plainly what was reversed instead of
+          # leaving a silent hole where a change used to be.
+          rm -f superseded.md
+          if [ -n "$left" ]; then
+            git log --first-parent --format='%B' "${left}..HEAD" 2>/dev/null \
+              | sed -n 's/^Superseded-by-upstream: /- /p' > superseded.md || true
+          fi
 
           {
             echo "### ${VERSION}"
@@ -774,6 +814,18 @@ jobs:
               echo 'Merged in from his tree. All thanks to Ducky for these.'
               echo
               cat ducky.md
+              echo
+            fi
+            # What the sync had to give up, so a change that is not here is not
+            # a mystery to whoever notices it missing.
+            if [ -s superseded.md ]; then
+              echo "### Handed back to Ducky's tree in this sync"
+              echo
+              echo 'These files are changed by both trees. His version won, so the'
+              echo 'change this fork had made to them is reversed until it is'
+              echo 're-applied on top of his work.'
+              echo
+              cat superseded.md
               echo
             fi
             echo '### Artifacts'
