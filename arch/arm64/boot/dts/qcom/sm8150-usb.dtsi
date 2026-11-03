@@ -31,6 +31,8 @@
 
 		USB3_GDSC-supply = <&usb30_prim_gdsc>;
 		dpdm-supply = <&usb2_phy0>;
+		qcom,usb-charger;
+
 		clocks = <&clock_gcc GCC_USB30_PRIM_MASTER_CLK>,
 			<&clock_gcc GCC_CFG_NOC_USB3_PRIM_AXI_CLK>,
 			<&clock_gcc GCC_AGGRE_USB3_PRIM_AXI_CLK>,
@@ -62,10 +64,11 @@
 
 		resets = <&clock_gcc GCC_USB30_PRIM_BCR>;
 		reset-names = "core_reset";
-
+		qcom,pm-qos-latency = <44>;
 		qcom,core-clk-rate = <200000000>;
 		qcom,core-clk-rate-hs = <66666667>;
 		qcom,num-gsi-evt-buffs = <0x3>;
+
 		qcom,gsi-reg-offset =
 			<0x0fc /* GSI_GENERAL_CFG */
 			 0x110 /* GSI_DBL_ADDR_L */

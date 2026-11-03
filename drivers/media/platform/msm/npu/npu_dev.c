@@ -139,7 +139,6 @@ static const char * const npu_exclude_rate_clocks[] = {
 	"at_clk",
 	"trig_clk",
 	"sleep_clk",
-	"xo_clk",
 	"conf_noc_ahb_clk",
 	"comp_noc_axi_clk",
 	"npu_core_cti_clk",
@@ -2217,7 +2216,9 @@ static int npu_probe(struct platform_device *pdev)
 	if (rc)
 		goto error_driver_init;
 
+#ifdef CONFIG_DEBUG_FS
 	npu_debugfs_init(npu_dev);
+#endif
 
 	rc = npu_host_init(npu_dev);
 	if (rc) {
