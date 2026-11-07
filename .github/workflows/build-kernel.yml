@@ -1,0 +1,883 @@
+name: Build kernel (SM8150 / vayu)
+
+# Publishing a release writes to the repository and the run cleanup deletes
+# older workflow runs, so the job has to ask for both explicitly; everything
+# else in this workflow only reads.
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'Defconfig fragment set'
+        required: false
+        default: 'vayu'
+        type: choice
+        options:
+          - vayu
+          - sm8150-common
+      variant:
+        description: >-
+          Build-time simplifications used to bisect a kernel that does not boot.
+          'stock' reproduces the vendor config exactly.
+        required: false
+        default: 'stock'
+        type: choice
+        options:
+          - stock
+          - no-lto
+          - no-lto-no-reloc
+      toolchain:
+        description: >-
+          'android-clang-22' is the Android prebuilt LLVM 22 toolchain, matching
+          the major version the vendor built this tree with (see
+          CONFIG_CC_VERSION_TEXT in the device's own config).
+          'llvm-18' keeps the Ubuntu toolchain as a control.
+        required: false
+        default: 'android-clang-22'
+        type: choice
+        options:
+          - android-clang-22
+          - llvm-18
+      ref:
+        description: 'Commit, branch or tag to build (default: the dispatched ref)'
+        required: false
+        default: ''
+        type: string
+      skip_sync_check:
+        description: >-
+          Build even when the branch does not contain the current
+          DUCKS-QCM-5-4 upstream tip. Normally such a build fails early: an
+          image missing upstream fixes is worse than no image.
+        required: false
+        default: false
+        type: boolean
+      toolchain_fallback:
+        description: >-
+          If the vendor clang cannot be downloaded (gitiles slow or unreachable),
+          continue with Ubuntu LLVM 18 instead of failing the job. The artifact
+          name records the fallback, so such a kernel is never mistaken for a
+          vendor-compiler build.
+        required: false
+        default: true
+        type: boolean
+      werror:
+        description: >-
+          Keep the tree's own CONFIG_CC_WERROR=y instead of downgrading warnings
+          to non-fatal. Default now that it is proven: run 39595908503 built the
+          whole tree with CC_WERROR=y and clang-r596125 and emitted zero
+          warnings. Set false only to bisect a boot problem where a warning from
+          unrelated vendor code would block the build.
+        required: false
+        default: true
+        type: boolean
+  # Called by sync-upstream.yml after it resets the branch to Ducky's tip, so a
+  # synced commit is built without needing a push (a push made with the
+  # workflow's own GITHUB_TOKEN starts no other workflow). Inputs mirror the
+  # dispatch ones; publish is call-only because a manual dispatch is usually a
+  # test and should not put a release on the repo.
+  workflow_call:
+    inputs:
+      config:
+        type: string
+        default: 'vayu'
+      variant:
+        type: string
+        default: 'stock'
+      toolchain:
+        type: string
+        default: 'android-clang-22'
+      ref:
+        type: string
+        default: ''
+      skip_sync_check:
+        type: boolean
+        default: false
+      toolchain_fallback:
+        type: boolean
+        default: true
+      werror:
+        type: boolean
+        default: true
+      publish:
+        type: boolean
+        default: true
+  push:
+    branches:
+      - MI_SM8150_5.4
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+
+concurrency:
+  # variant and ref are part of the key so that dispatching several bisect
+  # builds at once does not cancel the ones already running.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.variant }}-${{ inputs.ref }}-${{ inputs.werror }}
+  cancel-in-progress: true
+
+env:
+  # The kernel Makefile does `CC = $(CROSS_COMPILE)gcc`, and a plain Makefile
+  # assignment beats an environment variable, so the toolchain has to be
+  # passed as a make *argument*. MAKE_ARGS is therefore computed in the
+  # toolchain step once the compiler location is known, and exported through
+  # $GITHUB_ENV.
+
+  # The device's own kernel config records the compiler the vendor used:
+  #   CONFIG_CC_VERSION_TEXT="Android (15071444, +pgo, +bolt, +lto, +mlgo,
+  #     based on r596125) clang version 22.0.2"
+  # That is AOSP prebuilt clang-r596125, published on the android17-release
+  # branch: its AndroidVersion.txt reads "22.0.2 / based on r596125", and it
+  # ships manifest_15071444.xml — the same build number the config records. So
+  # this is the vendor's compiler exactly, not just the same major version.
+  # The branch named after the revision (mirror-goog-llvm-r596125-release) is a
+  # decoy: it contains no clang-r596125 directory and stops at clang-r584948b.
+  CLANG_PREBUILT_REF: android17-release
+  # Commit the branch pointed at when this was written, so the archive URL and
+  # the cache key stay immutable even if the branch moves.
+  CLANG_PREBUILT_SHA: 29182889399818f97baa65ea238c80e8117981eb
+  CLANG_PREBUILT_DIR: clang-r596125
+  CLANG_EXPECT_VERSION: clang version 22.0.2
+  CLANG_EXPECT_ANDROID_VERSION: '22.0.2'
+  CLANG_EXPECT_BUILD: '15071444'
+  # These two are what Android shows in parentheses after the kernel version.
+  KBUILD_BUILD_USER: kyler084
+  KBUILD_BUILD_HOST: murena.io
+  # Taken verbatim from the vayu device's own boot.img header, so the image we
+  # emit is laid out exactly like the one the bootloader already accepts.
+  BOOT_CMDLINE: >-
+    androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1
+    lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1
+    swiotlb=2048 loop.max_part=7 androidboot.usbcontroller=a600000.dwc3
+    androidboot.fstab_suffix=qcom androidboot.init_fatal_reboot_target=recovery
+  BOOT_OS_VERSION: '0x220001aa'
+  # Version shown in Android settings: 5.4.302-vayu-kyler084-0.0.<n>, where n
+  # climbs by one on every compile. n is whatever the workflow run number says,
+  # with BUILD_VERSION_BASE as the run that was "0.0.1"; no stored counter. The
+  # newest published release is checked as well and wins if it is higher, so the
+  # number never goes backwards when run numbers restart (repo move, re-create).
+  BUILD_VERSION_BASE: '27'
+
+jobs:
+  build:
+    name: >-
+      arm64 ${{ inputs.config || 'vayu' }}${{ inputs.variant && inputs.variant != 'stock' && format(' [{0}]', inputs.variant) || '' }}
+      (${{ inputs.toolchain || 'android-clang-22' }})
+    # ubuntu-24.04 is only the host; the compiler itself is the Android prebuilt
+    # named above. It is chosen over ubuntu-24.04's LLVM 18 because LLVM 18's
+    # ld.lld cannot resolve the ABS32 relocations CONFIG_MODVERSIONS emits for
+    # the __crc_* symbols, failing at the final vmlinux link, and because a
+    # kernel is only known-good against the compiler that produced the working
+    # image on the device.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # Deep enough that the changelog's base commit (.github/changelog-base)
+          # is inside the clone. The base is the fork point, and the distance to
+          # it grows by one with every commit, so this is headroom rather than a
+          # number that means anything by itself.
+          fetch-depth: 120
+          # Release tags are the changelog's left edge: `git describe --match
+          # 'kernel-*'` needs them even on a shallow clone.
+          fetch-tags: true
+          # drivers/kernelsu is the KernelSU-Next submodule. Its Kbuild derives
+          # KSU_VERSION from the submodule's own git history, so it needs a real
+          # clone with tags, not an empty directory.
+          submodules: recursive
+
+      - name: Show what is being built
+        run: |
+          git log --oneline -1
+          echo "--- KernelSU-Next submodule ---"
+          git submodule status --recursive
+
+      - name: Check the tree already contains the upstream (DUCKS-QCM-5-4) history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150
+          UPSTREAM_BRANCH: MI_SM8150_5.4
+          HEAD_REPO: ${{ github.repository }}
+          HEAD_BRANCH: MI_SM8150_5.4
+          SKIP: ${{ inputs.skip_sync_check || false }}
+        run: |
+          set -eu
+          # A build is only useful when it sits on top of the current upstream
+          # tip, otherwise fixes that already exist upstream silently go missing
+          # from the image.  Ask the API instead of the local clone: the checkout
+          # is shallow, so "is the parent tip an ancestor?" cannot be answered
+          # here.  Nothing is merged or rewritten, the build only fails early.
+          # This repository is not a fork, so GitHub's cross-repo compare
+          # endpoint answers 404. Ask for his tip and compare it with HEAD's
+          # parent: this branch is always his tip plus the CI commit.
+          up=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" --jq '.sha' 2>/dev/null) || {
+            echo '::warning::could not read the upstream tip (API error); sync check skipped'
+            exit 0
+          }
+          parent=$(git rev-parse 'HEAD^' 2>/dev/null || true)
+          echo "upstream tip: $up"
+          echo "HEAD parent:  ${parent:-unknown}"
+          if [ -n "$parent" ] && [ "$parent" = "$up" ]; then
+            echo "::notice::tree sits directly on the current upstream tip"
+            exit 0
+          fi
+          msg="this tree is not based on the current upstream tip ($UPSTREAM_REPO@$UPSTREAM_BRANCH $up)"
+          if [ "$SKIP" = "true" ]; then
+            echo "::warning::$msg (skip_sync_check=true, continuing)"
+          else
+            echo "::error::$msg"
+            exit 1
+          fi
+
+      - name: Complete the KernelSU-Next submodule history
+        run: |
+          set -eu
+          # Ducky's tree carries no KernelSU submodule. Skip instead of
+          # failing when the branch is a plain mirror of his work.
+          if [ ! -e drivers/kernelsu ]; then
+            echo 'no drivers/kernelsu in this tree; skipping'
+            exit 0
+          fi
+          # actions/checkout applies fetch-depth: 50 to submodules as well, and
+          # KernelSU derives KSU_VERSION from `git rev-list --count HEAD` and the
+          # tag from `git describe`. A 50-commit clone therefore builds as
+          # 30000+50 with no tag (the kernel is then recognised by nobody, and
+          # the manager treats it as ancient), which is exactly what the first
+          # KernelSU release shows. Its own Kbuild tries to unshallow, but only
+          # as a shell side effect, so do it here where a failure is visible.
+          git -C drivers/kernelsu fetch --unshallow --tags 2>/dev/null \
+            || git -C drivers/kernelsu fetch --tags
+          echo "KernelSU-Next: $(git -C drivers/kernelsu describe --tags) \
+          ($(git -C drivers/kernelsu rev-list --count HEAD) commits)"
+          # CONFIG_LOCALVERSION_AUTO makes the kernel release carry -g<sha>, so
+          # the build records which commit it came from.
+          echo "LOCALVERSION_AUTO sha: $(git rev-parse --short HEAD)"
+
+      - name: Apply local KernelSU-Next patches
+        run: |
+          set -eu
+          if [ ! -d drivers/kernelsu ]; then
+            echo 'no drivers/kernelsu in this tree; no patches to apply'
+            exit 0
+          fi
+          # drivers/kernelsu is a submodule of the upstream project, so fixes we
+          # need against the pinned commit cannot live in it — a push would have
+          # to go to upstream. They live in .github/kernelsu instead and are
+          # applied here, before anything reads the driver.
+          if [ ! -d .github/kernelsu ]; then
+            echo "patch directory missing from this tree; taking it from ${{ github.sha }}"
+            git fetch --depth=1 origin "${{ github.sha }}"
+            git checkout FETCH_HEAD -- .github/kernelsu
+          fi
+          shopt -s nullglob
+          patches=(.github/kernelsu/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo 'no KernelSU-Next patches to apply'
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "applying $p"
+            # --check first: a patch that no longer matches is a real failure,
+            # not something to paper over by building without it (the kernel
+            # would come out with a driver that cannot hand out its fd).
+            git -C drivers/kernelsu apply --check "$PWD/$p"
+            git -C drivers/kernelsu apply "$PWD/$p"
+          done
+          git -C drivers/kernelsu status --short
+
+      - name: Add swap (LTO needs headroom on 16 GB runners)
+        run: |
+          # Best effort: LTO_CLANG can be memory hungry. Never fail the job here.
+          if ! sudo swapon --show | grep -q '/'; then
+            sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192 status=none || true
+            sudo chmod 600 /swapfile2 || true
+            sudo mkswap /swapfile2 || true
+            sudo swapon /swapfile2 || true
+          fi
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex cpio rsync libssl-dev libelf-dev \
+            python3 make gcc file \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      # The prebuilt is ~2.4 GB extracted and is served by gitiles as an archive
+      # generated on demand, so caching it is what keeps a build from touching
+      # the network at all: the first green run on a runner populates this, every
+      # later run restores it. The key pins the exact commit, so switching the
+      # compiler is a new cache entry rather than a stale hit.
+      - name: Restore Android clang ${{ env.CLANG_PREBUILT_DIR }}
+        if: ${{ (inputs.toolchain || 'android-clang-22') != 'llvm-18' }}
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/${{ env.CLANG_PREBUILT_DIR }}
+          key: android-${{ env.CLANG_PREBUILT_DIR }}-${{ env.CLANG_PREBUILT_SHA }}-v1
+
+      - name: Install toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "${{ inputs.toolchain || 'android-clang-22' }}" = "llvm-18" ]; then
+            echo '::notice::using ubuntu LLVM 18 (control build)'
+            sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+            TOOLCHAIN=/usr/lib/llvm-18
+            # That directory already holds unversioned binaries, which is also
+            # what kbuild's LTO/CFI link rules look up on $PATH.
+            BIN="$TOOLCHAIN/bin"
+            CC_CMD=clang LD_CMD=ld.lld
+            AR_CMD=llvm-ar NM_CMD=llvm-nm
+            OBJCOPY_CMD=llvm-objcopy OBJDUMP_CMD=llvm-objdump
+            STRIP_CMD=llvm-strip READELF_CMD=llvm-readelf
+            # lld-18 installs into /usr/bin as ld.lld-18; fill in whatever is
+            # missing so both $BIN/$CC_CMD and the LTO link's $PATH lookups work.
+            for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                     llvm-strip llvm-readelf llvm-size llvm-symbolizer \
+                     llvm-profdata llvm-as opt llc; do
+              [ -e "$BIN/$t" ] || sudo ln -sf "/usr/bin/$t-18" "$BIN/$t"
+            done
+          else
+            TOOLCHAIN="$RUNNER_TOOL_CACHE/$CLANG_PREBUILT_DIR"
+            BIN="$TOOLCHAIN/bin"
+            AR_CMD=llvm-ar NM_CMD=llvm-nm
+            OBJCOPY_CMD=llvm-objcopy OBJDUMP_CMD=llvm-objdump
+            STRIP_CMD=llvm-strip READELF_CMD=llvm-readelf
+            CC_CMD=clang LD_CMD=ld.lld
+
+            if [ ! -x "$BIN/clang" ]; then
+              echo "fetching $CLANG_PREBUILT_DIR (build $CLANG_EXPECT_BUILD) at $CLANG_PREBUILT_SHA"
+              rc=0
+              # scripts/fetch-toolchain.sh is deliberately outside the workflow:
+              # it is the only step that depends on a third party, so it has to be
+              # runnable (and testable) on a workstation. Exit 75 means the network
+              # was exhausted, which is the one failure worth continuing through;
+              # 65 means wrong content arrived and must not be papered over.
+              DEST="$TOOLCHAIN" \
+              ATTEMPTS=3 \
+              EXPECT_ANDROID_VERSION="$CLANG_EXPECT_ANDROID_VERSION" \
+              EXPECT_BUILD="$CLANG_EXPECT_BUILD" \
+                bash scripts/fetch-toolchain.sh || rc=$?
+
+              if [ "$rc" -eq 75 ] && [ "${{ inputs.toolchain_fallback }}" = "true" ]; then
+                echo "::warning title=Toolchain download failed::gitiles did not serve $CLANG_PREBUILT_DIR; building with Ubuntu LLVM 18 instead. Artifact name is marked llvm18-fallback and is NOT the vendor compiler."
+                TOOLCHAIN=/usr/lib/llvm-18
+                BIN="$TOOLCHAIN/bin"
+                sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+                for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                         llvm-strip llvm-readelf llvm-size llvm-symbolizer \
+                         llvm-profdata llvm-as opt llc; do
+                  [ -e "$BIN/$t" ] || sudo ln -sf "/usr/bin/$t-18" "$BIN/$t"
+                done
+                TOOLCHAIN_FALLBACK=1
+              elif [ "$rc" -ne 0 ]; then
+                echo '::error::the vendor toolchain could not be installed (see the messages above); refusing to build with a different compiler silently. Re-run once the network recovers, or dispatch with toolchain=llvm-18 knowingly.'
+                exit 1
+              fi
+            else
+              echo "restored $CLANG_PREBUILT_DIR from cache"
+            fi
+
+            if ldd "$BIN/clang" 2>&1 | grep -q 'not found'; then
+              echo '::warning::prebuilt clang has unresolved shared libraries:'
+              ldd "$BIN/clang" | grep 'not found' || true
+              sudo apt-get install -y --no-install-recommends libtinfo5 libncurses5 2>/dev/null \
+                || echo '::warning::could not install legacy terminfo packages'
+            fi
+          fi
+
+          # Record which compiler actually ended up in use, so the artifact can
+          # say so without anyone having to read the log.
+          if [ "${TOOLCHAIN_FALLBACK:-0}" = 1 ]; then
+            TOOLCHAIN_ID=llvm18-fallback
+          elif [ "${{ inputs.toolchain || 'android-clang-22' }}" = "llvm-18" ]; then
+            TOOLCHAIN_ID=llvm-18
+          else
+            TOOLCHAIN_ID=android-clang-22
+          fi
+          echo "TOOLCHAIN_ID=$TOOLCHAIN_ID" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_FALLBACK=${TOOLCHAIN_FALLBACK:-0}" >> "$GITHUB_ENV"
+
+          # Make the whole toolchain reachable by bare name: kbuild's LTO/CFI
+          # rules call llvm-nm/llvm-objcopy/llvm-ar off $PATH, not $(NM) etc.
+          echo "PATH=$BIN:$PATH" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+          # Build number: 0.0.N, climbing by one on every compile. Passing
+          # LOCALVERSION on the make command line also makes
+          # scripts/setlocalversion drop the -g<sha> suffix, which is the long
+          # string that used to end the version shown in settings.
+          #
+          # The run number is the cheap source for N, but it restarts at 1 when a
+          # repo is moved or re-created, which is exactly how a build came out as
+          # 0.0.1 after the private repo was made. So the newest version in the
+          # tag list is a floor: N never goes backwards, and after a move it
+          # carries on from the last build instead of starting over.
+          if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
+            ver=$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE ))
+            [ "$ver" -lt 1 ] && ver=1
+            # Tags rather than releases: a release can be deleted while its tag
+            # and images stay, and this build already found one that had gone
+            # missing and read the floor from a much older version. Both sources
+            # are checked and the higher wins.
+            last=$( { gh release list --limit 200 --json tagName \
+                        --jq '.[].tagName' 2>/dev/null
+                      git ls-remote --tags origin 2>/dev/null \
+                        | sed 's|.*refs/tags/||'
+                    } \
+              | sed -n 's/^kernel-.*-0\.0\.\([0-9][0-9]*\)-[0-9-]*$/\1/p' \
+              | sort -n | tail -1)
+            if [ -n "${last:-}" ] && [ "$last" -ge "$ver" ]; then
+              ver=$(( last + 1 ))
+              echo "::notice::run number wanted 0.0.$(( GITHUB_RUN_NUMBER - BUILD_VERSION_BASE )); newest tag is 0.0.${last}, so this build is 0.0.${ver}"
+            fi
+            LOCALVERSION="-0.0.${ver}"
+          else
+            LOCALVERSION=""
+          fi
+          echo "LOCALVERSION=$LOCALVERSION" >> "$GITHUB_ENV"
+          echo "build version: 5.4.302-vayu-kyler084${LOCALVERSION}"
+
+          # One line, space separated: make matches the last assignment of a
+          # variable, so later flags override anything inherited.
+          echo "MAKE_ARGS=ARCH=arm64 CC=$BIN/$CC_CMD LD=$BIN/$LD_CMD AR=$BIN/$AR_CMD NM=$BIN/$NM_CMD OBJCOPY=$BIN/$OBJCOPY_CMD OBJDUMP=$BIN/$OBJDUMP_CMD STRIP=$BIN/$STRIP_CMD READELF=$BIN/$READELF_CMD CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- LOCALVERSION=$LOCALVERSION" >> "$GITHUB_ENV"
+
+          echo '--- versions ---'
+          "$BIN/$CC_CMD" --version | head -2
+          "$BIN/$LD_CMD" --version | head -1
+          "$BIN/llvm-nm" --version | head -1
+          aarch64-linux-gnu-ld --version | head -1
+
+          # Fail loudly if the download resolved to the wrong compiler: the whole
+          # point of this job is to match the vendor's clang 22.0.2 (build
+          # 15071444) rather than whichever LLVM the runner happens to ship.
+          # Skipped only on the explicit, clearly labelled fallback path above.
+          if [ "${{ inputs.toolchain || 'android-clang-22' }}" != "llvm-18" ] && [ "${TOOLCHAIN_FALLBACK:-0}" != 1 ]; then
+            head1=$("$BIN/clang" --version | head -1)
+            echo "$head1" | grep -q "$CLANG_EXPECT_VERSION" \
+              || { echo "::error::expected '$CLANG_EXPECT_VERSION', got: $head1"; exit 1; }
+            echo "$head1" | grep -q 'Android' \
+              || { echo "::error::not an Android prebuilt: $head1"; exit 1; }
+            [ -x "$BIN/ld.lld" ] || { echo '::error::ld.lld missing'; exit 1; }
+            "$BIN/ld.lld" --version
+            echo "toolchain: $head1"
+
+            # A hash of every file in the compiler, shipped with the artifacts.
+            # That lets a toolchain found inside a ROM dump (a 2.4 GB tree nobody
+            # wants to move around) be compared against the one that actually
+            # built this kernel: see scripts/compare-toolchain.sh.
+            {
+              echo "# clang: $head1"
+              echo "# android-version: $(head -1 "$TOOLCHAIN/AndroidVersion.txt" 2>/dev/null)"
+              echo "# build-manifest: $(ls "$TOOLCHAIN"/manifest_*.xml 2>/dev/null | head -1 | xargs -r basename)"
+            } > toolchain-manifest.txt
+            # %P keeps paths relative without a leading ./, which is what
+            # compare-toolchain.sh matches on. The separator must be a real NUL
+            # (%P\0, one backslash): with a doubled backslash find emits the
+            # literal text \0 instead, sort -z sees a single huge line and
+            # xargs dies with "argument line too long". -n bounds the command
+            # line for the ~10k files without disturbing the sorted order.
+            ( cd "$TOOLCHAIN" && find . -type f -printf '%P\0' \
+                | LC_ALL=C sort -z | xargs -0 -r -n 200 sha256sum ) >> toolchain-manifest.txt
+            echo "toolchain manifest: $(grep -vc '^#' toolchain-manifest.txt) files"
+          fi
+
+      - name: Configure
+        run: |
+          set -eu
+          # kbuild's %.config rule merges each fragment onto the .config that
+          # already exists (scripts/kconfig/merge_config.sh -m .config ...),
+          # so the base defconfig must be generated first and each fragment
+          # applied in its own `make` invocation. This is exactly the order
+          # TARGET_KERNEL_CONFIG uses in BoardConfigCommon.mk.
+          make O=out $MAKE_ARGS vendor/sm8150-qgki_defconfig
+          make O=out $MAKE_ARGS vendor/xiaomi/sm8150-common.config
+          make O=out $MAKE_ARGS vendor/xiaomi/${{ inputs.config || 'vayu' }}.config
+
+          echo "--- key config values ---"
+          grep -E '^CONFIG_(LOCALVERSION|ARCH_QCOM|RPS|I2C)=' out/.config
+          grep -q '^CONFIG_ARCH_QCOM=y' out/.config \
+            || { echo '::error::ARCH_QCOM not enabled; the defconfig base was lost'; exit 1; }
+
+          # The tree sets CONFIG_CC_WERROR=y. It used to be dropped here on the
+          # theory that a slightly different LLVM sub-revision would turn a
+          # warning into a build failure — but the toolchain now matches the
+          # vendor's exactly, and a strict build (run 39595908503, werror=true)
+          # compiled 3961 objects with CC_WERROR=y and produced no warnings at
+          # all. So the vendor policy is the default again: a warning here is a
+          # real defect. werror=false remains for bisecting a boot failure.
+          if [ "${{ inputs.werror }}" = 'true' ]; then
+            echo "strict build: keeping CONFIG_CC_WERROR=y"
+          else
+            scripts/config --file out/.config -d CC_WERROR
+            # Drop stale generated config so the next make cannot inherit the
+            # previous CONFIG_CC_WERROR=y through include/config/auto.conf.
+            rm -f out/include/config/auto.conf out/include/config/auto.conf.cmd \
+                  out/include/generated/autoconf.h
+          fi
+
+          # Optional simplifications for bisecting a kernel that the bootloader
+          # refuses to start. LTO/CFI and the KASLR relocation data are the two
+          # parts of the image that depend most on the exact LLVM version, and
+          # a bad relocation table crashes before the first console write, so
+          # the device shows nothing at all.
+          case "${{ inputs.variant || 'stock' }}" in
+            stock)
+              ;;
+            no-lto)
+              scripts/config --file out/.config \
+                -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE \
+                -d CFI_CLANG -d CFI_PERMISSIVE -d SHADOW_CALL_STACK \
+                -d CC_IS_CLANG_CFI
+              ;;
+            no-lto-no-reloc)
+              scripts/config --file out/.config \
+                -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE \
+                -d CFI_CLANG -d CFI_PERMISSIVE -d SHADOW_CALL_STACK \
+                -d CC_IS_CLANG_CFI \
+                -d RANDOMIZE_BASE -d RELOCATABLE
+              ;;
+            *)
+              echo "::error::unknown variant '${{ inputs.variant }}'"
+              exit 1
+              ;;
+          esac
+          make O=out $MAKE_ARGS olddefconfig
+          if [ "${{ inputs.werror }}" = 'true' ]; then
+            grep -E '^CONFIG_CC_WERROR=y' out/.config \
+              || { echo '::error::CC_WERROR was expected to stay enabled'; exit 1; }
+          else
+            grep -E '^# CONFIG_CC_WERROR is not set' out/.config \
+              || { echo '::error::CC_WERROR still enabled'; exit 1; }
+          fi
+
+          echo "--- LTO/CFI/KASLR state (variant=${{ inputs.variant || 'stock' }}) ---"
+          grep -E '^CONFIG_(LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG|SHADOW_CALL_STACK|RELOCATABLE|RANDOMIZE_BASE)=' \
+            out/.config || true
+          grep -E '^# CONFIG_(LTO_CLANG|LTO_NONE|CFI_CLANG|SHADOW_CALL_STACK|RELOCATABLE|RANDOMIZE_BASE) is not set' \
+            out/.config || true
+
+      - name: Build
+        run: |
+          set -o pipefail
+          # -k on a strict run: make stops at the first -Werror failure, and a
+          # census of one warning per dispatch would take a dozen builds.
+          extra=""
+          [ "${{ inputs.werror }}" = 'true' ] && extra="-k"
+          make O=out $MAKE_ARGS $extra -j"$(nproc)" Image dtbs 2>&1 | tee build.log
+
+      - name: Fetch packaging tools
+        if: success()
+        run: |
+          set -eu
+          # The packagers live in the branch that dispatched this run, but `ref`
+          # can point at an older tree that predates them — the vendor baseline
+          # does. Losing a finished 12-minute build to a missing helper script is
+          # pure waste, so borrow them from the workflow's own commit.
+          if [ -f .github/bootimg/splice_boot.py ] \
+             && [ -f .github/bootimg/boot-template.img.gz ] \
+             && [ -f .github/bootimg/mkdtimg.py ] \
+             && [ -f .github/bootimg/pick_dtb.py ] \
+             && [ -f .github/bootimg/verify_images.py ]; then
+            echo 'packaging tools present in the checked-out tree'
+            exit 0
+          fi
+          echo "packaging tools missing from this tree; taking them from ${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout FETCH_HEAD -- .github/bootimg
+          ls -l .github/bootimg
+
+      - name: Package boot.img and dtbo.img
+        if: success()
+        run: |
+          set -eu
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image dist/Image
+          cp out/.config dist/kernel.config
+          cp toolchain-manifest.txt dist/ 2>/dev/null || true
+
+          # --- boot.img ---------------------------------------------------
+          # Spliced into the vendor's own 128 MiB boot partition image rather
+          # than generated from scratch. The bootloader on this device refuses
+          # every image built by mkbootimg_v2.py — even with identical header
+          # fields, full partition length and a valid AVB footer — and boots
+          # any image derived from the vendor dump; see AUDIT.md section 7.
+          # The template keeps the vendor's AVB footer byte for byte, and its
+          # ramdisk, which is the one the installed ROM expects.
+          #
+          # The appended device tree is this tree's own, not the template's.
+          # Keeping the template's DTB meant the image described the pre-merge
+          # hardware: device-tree fixes in this branch were compiled and then
+          # never reached the phone. pick_dtb.py chooses between the bases this
+          # tree builds from the identifiers the bootloader itself matches on
+          # (qcom,msm-id / qcom,board-id), so the dtbo built in the same run is
+          # still applied to the right silicon.
+          BOOT_DTB="$(python3 .github/bootimg/pick_dtb.py \
+            --template .github/bootimg/boot-template.img.gz \
+            out/arch/arm64/boot/dts/xiaomi/sm8150-xiaomi.dtb \
+            out/arch/arm64/boot/dts/xiaomi/sm8150-v2-xiaomi.dtb)"
+          echo "boot dtb: $BOOT_DTB"
+          python3 .github/bootimg/splice_boot.py \
+            --template .github/bootimg/boot-template.img.gz \
+            --kernel out/arch/arm64/boot/Image \
+            --dtb "$BOOT_DTB" \
+            -o dist/boot.img
+          echo "BOOT_DTB=$BOOT_DTB" >> "$GITHUB_ENV"
+
+          # --- dtbo.img ---------------------------------------------------
+          dtbo="$(find out/arch/arm64/boot/dts -name 'vayu-sm8150-overlay.dtbo' | head -1)"
+          if [ -z "$dtbo" ]; then
+            echo '::error::vayu-sm8150-overlay.dtbo was not built'
+            exit 1
+          fi
+          python3 .github/bootimg/mkdtimg.py "$dtbo" --page_size 4096 -o dist/dtbo.img
+          find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} dist/ \;
+
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Package TWRP flashable zip
+        if: success()
+        run: |
+          set -eu
+          VERSION="5.4.302-vayu-kyler084${LOCALVERSION}"
+          ZIP="vayu-kernel-${VERSION}.zip"
+          python3 .github/twrp/make_twrp_zip.py --dist dist --version "$VERSION" \
+            --out "dist/$ZIP"
+          # Rewrite the checksums now that the zip exists, and list the files
+          # explicitly: `sha256sum *` also hashes the checksum file itself,
+          # because the redirection creates it before the glob is expanded.
+          # Only files that are actually attached to the release are hashed -
+          # Image stays in the Actions artifact, and a line for it here made
+          # `sha256sum -c` fail for anyone verifying a download.
+          (cd dist && sha256sum boot.img dtbo.img kernel.config "$ZIP" \
+              > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Verify packaged images
+        if: success()
+        # The second argument is the DTB that was spliced in: the packaged image
+        # is rejected unless its appended tree is byte-identical to the one this
+        # build produced, which is what makes device-tree changes actually ship.
+        run: python3 .github/bootimg/verify_images.py dist "$BOOT_DTB"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-arm64-${{ inputs.config || 'vayu' }}${{ inputs.variant && inputs.variant != 'stock' && format('-{0}', inputs.variant) || '' }}-${{ env.TOOLCHAIN_ID }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      # Every successful normal build becomes a release, so the device history is
+      # a list of flashable kernels rather than a pile of 30-day artifacts.
+      # Bisect variants and toolchain-fallback builds stay out of it: they answer
+      # a question about a kernel that is not meant to be installed.
+      - name: Publish GitHub release
+        if: >-
+          success() && (github.event_name == 'push' || inputs.publish == true)
+          && (inputs.variant || 'stock') == 'stock'
+          && (inputs.toolchain || 'android-clang-22') == 'android-clang-22'
+          && env.TOOLCHAIN_FALLBACK == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          VERSION="5.4.302-vayu-kyler084${LOCALVERSION}"
+          DATE=$(date -u +%Y-%m-%d)
+
+          # One ROM, one branch: the tag also decides which older releases the
+          # prune at the end of this step is allowed to delete. The version
+          # string already says vayu, so the tag is kernel-<version>-<date>
+          # rather than vayu-<version>-<date> with the device named twice.
+          TAG="kernel-${VERSION}-${DATE}"
+          SHA=$(git rev-parse --short HEAD)
+          UPSTREAM=$(git rev-parse --short=12 'HEAD^' 2>/dev/null || echo unknown)
+
+          ROOT=""
+          if grep -q '^CONFIG_KSU=y' out/.config; then
+            ksu_tag=$(git -C drivers/kernelsu describe --tags --abbrev=0 2>/dev/null \
+              || echo "commit $(git -C drivers/kernelsu rev-parse --short HEAD)")
+            ksu_ver=$(sed -n 's/.*KernelSU-Next version: \([0-9]*\).*/\1/p' build.log | head -1)
+            ROOT="KernelSU-Next ${ksu_tag} (builtin, KSU_VERSION ${ksu_ver:-unknown})"
+          fi
+
+          # Changelog: cumulative, not just what landed in the last few hours.
+          # Each build replaces the previous release, so "changes since the last
+          # tag" would mean a fresh reader never sees the battery, charging or
+          # KernelSU work that is still in the kernel. .github/changelog-base
+          # records the fork point (Ducky's tip before this branch started) and
+          # everything on top of it is listed every time.
+          #
+          # --first-parent keeps Ducky's own commits that arrived through merges
+          # out of the list: they are his work, already covered by the credit.
+          # --no-merges drops the merge commits themselves.
+          #
+          # Only kernel changes belong here. CI, docs and repo plumbing commits
+          # are how the build and the release page got made, not something a
+          # reader flashing a kernel needs to scroll past, so the prefixes are
+          # filtered out of every path below.
+          # Commits that are not kernel changes: repo plumbing, and the
+          # "tree:" bookkeeping commits that add and then take away the same
+          # patches, which net to nothing and only confuse the notes.
+          NOISE='(ci|cl|docs|github|chore|tree)[:(]'
+          base=$(sed -n '1p' .github/changelog-base 2>/dev/null || true)
+          if [ -n "$base" ]; then
+            if git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "changes since fork point $base"
+              git log --first-parent --no-merges --format='- %s (%h)' \
+                "${base}..HEAD" | grep -vE "^- ($NOISE)" \
+                | grep -vE '^- Revert "tree:' > changes.md || true
+            else
+              echo "::warning::changelog base $base is not in this clone (fetch-depth too shallow); falling back"
+            fi
+          fi
+          if [ ! -s changes.md ]; then
+            prev=$(git describe --tags --abbrev=0 --match 'kernel-*' 2>/dev/null || true)
+            if [ -n "$prev" ]; then
+              echo "changes since $prev"
+              git log --no-merges --format='- %s (%h)' "$prev..HEAD" \
+                | grep -vE "^- ($NOISE)" > changes.md || true
+            else
+              echo 'no base or previous tag available; listing recent kernel commits'
+              git log --no-merges -n 40 --format='- %s (%h)' \
+                | grep -vE "^- ($NOISE)" | head -15 > changes.md || true
+            fi
+          fi
+          [ -s changes.md ] || echo '- (no commits recorded)' > changes.md
+
+          # Ducky's own work, credited separately. This branch is his tree and
+          # nothing else, so every kernel commit in the build is his;
+          # .github/ducky-changes.md is written by the sync job and lists exactly
+          # what his tree gained since the previous build. A build that did not
+          # come from a sync (an older ref, say) falls back to his recent commits.
+          rm -f ducky.md
+          MIRROR=0
+          if [ -s .github/ducky-changes.md ]; then
+            MIRROR=1
+            grep -v '^<!--' .github/ducky-changes.md > ducky.md || true
+          elif git rev-parse -q --verify 'HEAD^' >/dev/null 2>&1; then
+            git log --no-merges -n 25 --format='- %s (%h)' 'HEAD^' > ducky.md || true
+          fi
+          rm -f superseded.md
+          {
+            echo "### ${VERSION}"
+            echo
+            echo '| field | value |'
+            echo '| --- | --- |'
+            echo '| device | vayu (Xiaomi SM8150, LineageOS 24.0 / Android 17) |'
+            echo "| kernel | ${VERSION} |"
+            echo '| builder | kyler084@murena.io |'
+            echo "| toolchain | ${{ env.TOOLCHAIN_ID }} |"
+            echo "| root | ${ROOT:-none} |"
+            echo "| commit | ${SHA} |"
+            echo "| upstream | ${UPSTREAM} (Ducky) |"
+            echo "| date | ${DATE} |"
+            echo '| config | vayu, stock variant |'
+            echo
+            # Hand-written prose, kept in the repo rather than in this workflow so
+            # the wording can be changed without touching CI. If the file is
+            # missing or empty, the commit list below is all the notes get.
+            if [ -s .github/release-highlights.md ]; then
+              echo
+              # The file opens with an HTML comment explaining how to edit it.
+              # It is a note to whoever changes the file, not to anyone reading
+              # the release, so drop the comment block from the notes.
+              sed '/^<!--$/,/^-->$/d' .github/release-highlights.md
+              echo
+            fi
+            # A mirror build has one commit list, his; printing it twice under
+            # two headings only makes the notes longer.
+            if [ "${MIRROR:-0}" != 1 ]; then
+              echo '### Commits in this build'
+              echo
+              cat changes.md
+              echo
+            fi
+            # His side of the merge, kept separate so it reads as his work.
+            if [ -s ducky.md ]; then
+              echo "### Ducky's changes in this build"
+              echo
+              echo "This kernel is Ducky's MI_SM8150_5.4 tree unmodified, at \`${UPSTREAM}\`."
+              echo
+              cat ducky.md
+              echo
+            fi
+            # What the sync had to give up, so a change that is not here is not
+            # a mystery to whoever notices it missing.
+            if [ -s superseded.md ]; then
+              echo "### Handed back to Ducky's tree in this sync"
+              echo
+              echo 'These files are changed by both trees. His version won, so the'
+              echo 'change this fork had made to them is reversed until it is'
+              echo 're-applied on top of his work.'
+              echo
+              cat superseded.md
+              echo
+            fi
+            echo '### Artifacts'
+            echo
+            echo '- `boot.img` — `fastboot flash boot boot.img` (128 MiB, spliced into the vendor container with its AVB footer and appended DTB intact)'
+            echo '- `dtbo.img` — `fastboot flash dtbo dtbo.img`'
+            echo '- `vayu-kernel-*.zip` — TWRP flashable: writes both partitions and keeps the previous pair on /sdcard'
+            echo '- `kernel.config` — the exact config this kernel was built with'
+            echo '- `SHA256SUMS.txt` — verify before flashing'
+            echo
+            echo "Built by [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}); images verified by verify_images.py before upload."
+            echo
+            echo '### Credits'
+            echo
+            echo 'This branch is the unmodified MI_SM8150_5.4 tree of [Ducky](https://github.com/DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150). Every kernel change in this build is his; all credit goes to him.'
+          } > notes.md
+
+          # A re-run of the same dispatch keeps its run number, so replace rather
+          # than fail on a tag that already exists.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          TITLE="${VERSION}${ROOT:+ · ${ROOT}} · ${DATE}"
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes-file notes.md \
+            dist/boot.img dist/dtbo.img dist/*.zip dist/SHA256SUMS.txt \
+            dist/kernel.config build.log
+          echo "published $TAG"
+
+          # Every release stays: the version in the tag is the only thing that
+          # says which kernel a bug report came from, so nothing is deleted
+          # here. A re-run of the same dispatch is still replaced above, since
+          # that is the same version, not an older one.
+
+          # Likewise for the Actions history: keep the run that produced the
+          # live release and drop the rest, so the list is not a wall of
+          # cancelled and superseded builds. Only completed runs are touched -
+          # a parallel dispatch still building is none of this step's business.
+          echo 'pruning old workflow runs'
+          gh run list --workflow build-kernel.yml --limit 100 \
+            --json databaseId,status --jq '.[] | select(.status == "completed") | .databaseId' \
+            | while read -r run; do
+                [ "$run" = "${{ github.run_id }}" ] && continue
+                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run" >/dev/null 2>&1 \
+                  && echo "deleted run $run" \
+                  || echo "::warning::could not delete run $run"
+              done
