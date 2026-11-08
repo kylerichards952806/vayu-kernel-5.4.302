@@ -1,0 +1,187 @@
+name: Sync Ducky's upstream and build
+
+# This branch is Ducky's tree and nothing else. The commit on top of his tip
+# holds only the CI files the build needs, plus .github/ducky-changes.md, which
+# tells the release notes exactly what his tree brought in this time.
+#
+# Hourly, the branch is compared with his MI_SM8150_5.4. When he has commits
+# this branch does not, the branch is reset to his tip, the CI files go back on
+# top, the result is force-pushed, and the build runs in this same workflow run.
+# It has to be a job here rather than a `push` trigger: a push made with
+# GITHUB_TOKEN starts no other workflow.
+
+on:
+  schedule:
+    # Hourly, off the hour. Scheduled runs are best-effort and can be late under
+    # load; polling faster mostly buys a bigger Actions bill on a private repo.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: >-
+          Build again even when the branch already matches Ducky's tip. The
+          commit is empty, but the build and its release are normal.
+        type: boolean
+        default: false
+
+permissions:
+  # contents: push the reset branch and publish the release.
+  # actions: the build workflow's cleanup deletes its older runs.
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: DUCKS-QCM-5-4/android_kernel_xiaomi_sm8150
+  UPSTREAM_BRANCH: MI_SM8150_5.4
+  BRANCH: MI_SM8150_5.4
+
+jobs:
+  check:
+    name: Compare with Ducky's tip
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - name: Compare the branch base with his tip
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # This repository is not a fork, so GitHub's cross-repo compare
+          # endpoint answers 404 for it. Ask for the two commits instead: the
+          # branch is always his tip plus one CI commit, so his tip is the
+          # parent of ours.
+          upstream_api() { gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}"; }
+          up=$(upstream_api --jq '.sha' 2>/dev/null || upstream_api --jq '.sha')
+          if [ -z "${up:-}" ]; then
+            echo '::error::could not read his tip from the API'
+            exit 1
+          fi
+          branch_api() { gh api "repos/${GITHUB_REPOSITORY}/commits/${BRANCH}"; }
+          parent=$(branch_api --jq '.parents[0].sha' 2>/dev/null \
+            || branch_api --jq '.parents[0].sha' || true)
+          echo "his tip:   $up"
+          echo "our base:  ${parent:-none}"
+          if [ "${parent:-}" = "$up" ] && [ "${{ inputs.rebuild }}" != 'true' ]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  sync:
+    name: Reset to Ducky's tree
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.reset.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Reset, restore the CI files, record his changes, force-push
+        id: reset
+        run: |
+          set -eu
+          old=$(git rev-parse HEAD)
+          # The checkout is one commit deep, so HEAD^ has no object here; the
+          # commit header still records the parent.
+          last=$(git cat-file commit HEAD | sed -n 's/^parent //p' | head -1)
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags --depth=1 upstream "${UPSTREAM_BRANCH}"
+          up=$(git rev-parse FETCH_HEAD)
+          echo "resetting ${old:0:7} to ${up:0:7}"
+
+          # The push carries the chain from his new tip back to the commit this
+          # branch was last synced to, so deepen until that commit is present.
+          for d in 50 200 800 3000; do
+            if git cat-file -e "${last}^{commit}" 2>/dev/null; then break; fi
+            echo "deepening to $d"
+            git fetch --no-tags --depth="$d" upstream "${UPSTREAM_BRANCH}"
+          done
+          if ! git cat-file -e "${last}^{commit}" 2>/dev/null; then
+            echo 'his history was rewritten; fetching all of it'
+            git fetch --no-tags --unshallow upstream "${UPSTREAM_BRANCH}" 2>/dev/null \
+              || git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          fi
+
+          git reset --hard "$up"
+          # Only these paths may survive the reset. Everything else is his.
+          git checkout "$old" -- \
+            .github/bootimg .github/twrp .github/workflows scripts/fetch-toolchain.sh
+          # The previous list is the right one for a rebuild.
+          git checkout "$old" -- .github/ducky-changes.md 2>/dev/null || true
+
+          # "Ducky's changes in this build" in the release notes comes from
+          # here: every commit his tree gained since the previous build.
+          n=$(git rev-list --count --no-merges "${last}..${up}" 2>/dev/null || echo 0)
+          echo "his commits in this sync: ${n:-0}"
+          if [ "${n:-0}" -gt 0 ]; then
+            {
+              echo '<!-- written by sync-upstream.yml; do not edit -->'
+              git log --no-merges --format='- %s (`%h`)' "${last}..${up}" | head -80
+              if [ "$n" -gt 80 ]; then echo "- and $((n - 80)) more in his tree"; fi
+            } > .github/ducky-changes.md
+          elif [ ! -s .github/ducky-changes.md ]; then
+            {
+              echo '<!-- written by sync-upstream.yml; do not edit -->'
+              printf -- '- rebuild of his tree at %s; no new upstream commits\n' \
+                "$(git rev-parse --short "$up")"
+            } > .github/ducky-changes.md
+          else
+            echo 'no upstream delta; keeping the existing changelog'
+          fi
+          ls -l .github/ducky-changes.md
+
+          git config user.name  kyler084
+          git config user.email kyler084@murena.io
+          git add -A
+          # .github is a dot-directory; be explicit rather than rely on -A.
+          git add -f .github/ducky-changes.md
+          git status --short | head -20
+
+          # Guard: outside the CI paths the tree must be byte-identical to his.
+          if git diff --cached --quiet "$up" -- . \
+               ':(exclude).github' ':(exclude)scripts/fetch-toolchain.sh'; then
+            echo 'tree matches his tip outside the CI paths'
+          else
+            echo '::error::the reset left changes outside .github and scripts/fetch-toolchain.sh'
+            git diff --cached --stat "$up" -- . \
+              ':(exclude).github' ':(exclude)scripts/fetch-toolchain.sh'
+            exit 1
+          fi
+
+          # --allow-empty: a history-only change on his side must still move the
+          # branch, or the next run would try the same reset again.
+          git commit --allow-empty -m "ci: sync with Ducky's MI_SM8150_5.4 at ${up:0:7}"
+          if ! git cat-file -e 'HEAD:.github/ducky-changes.md'; then
+            echo '::error::the changelog file did not make it into the commit'
+            exit 1
+          fi
+          git push --force-with-lease="${BRANCH}:${old}" origin "HEAD:${BRANCH}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build the synced kernel
+    needs: [check, sync]
+    if: needs.check.outputs.changed == 'true'
+    uses: ./.github/workflows/build-kernel.yml
+    with:
+      ref: ${{ needs.sync.outputs.sha }}
+      config: vayu
+      variant: stock
+      toolchain: android-clang-22
+      skip_sync_check: false
+      toolchain_fallback: true
+      werror: true
+      publish: true
